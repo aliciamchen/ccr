@@ -79,7 +79,11 @@ var update_posterior = function (scenario, closeness_R, beliefs, actionsSoFar) {
     // console.log(closeness_A);
 
     mapData({ data: actionsSoFar }, function (action) {
-      observe(base_actor(scenario, closeness_A, closeness_R), {
+    //   observe(base_actor(scenario, closeness_A, closeness_R), {
+    //     action_risk: action,
+    //   });
+
+      observe(comm_actor(scenario, closeness_A, closeness_prior), {
         action_risk: action,
       });
     });
@@ -147,7 +151,7 @@ var run = function (scenario, condition, dataSoFar) {
   }
 };
 
-var f = csv.open("output.csv");
+var f = csv.open("output_commweight1.csv");
 csv.writeLine(
   "beta,comfort_discount,participant_num,closeness_alice,closeness_bob,round,alice_action,bob_action,alice_beliefs,bob_beliefs",
   f
