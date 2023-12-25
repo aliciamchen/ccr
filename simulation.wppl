@@ -1,130 +1,204 @@
-var params = {
-    alpha: 1
-}
+// webppl sequential.wppl --require webppl-csv
 
-var round = function (num, precision) {
-    Number.parseFloat(num.toFixed(precision));
+var params = {
+  beta: 1,
+  comfort_discount: 1, // how much do you value partner's comfort relative to your own?
+  participants: 300,
+  roles: ["alice", "bob"],
+  n_rounds: 20,
+  closenesses: [1, 2, 3, 4],
+  action_risks: [1, 2, 3],
 };
 
-var Beta_disc = cache(function (hypers) {
-    return Infer({ method: 'enumerate' }, function () {
-        var n = uniformDraw(_.range(0, 1, 0.01));
-        var bta = Beta({
-            a: hypers.a == 0 ? 1 : hypers.a,
-            b: hypers.b == 0 ? 1 : hypers.b
-        });
-        factor(bta.score(n));
-        return round(n, 2);
-    })
+// comfort for each scenario, based on closeness and risk
+var comfort = function (scenario, closeness, risk) {
+  // format: scenario -> closeness -> risk -> comfort
+  // closeness is 1-4 (not close -> extremely close), risk is 1-3 (low -> high)
+  var scenarios = {
+    mac: {
+      1: { 1: 5, 2: 3.5, 3: 2.5 },
+      2: { 1: 5.5, 2: 4.5, 3: 3.5 },
+      3: { 1: 6, 2: 5, 3: 4.5 },
+      4: { 1: 6, 2: 5.8, 3: 5.7 },
+    },
+  };
+
+  return scenarios[scenario][closeness][risk];
+};
+
+var closeness_prior = Categorical({
+  vs: params.closenesses,
+  ps: [0.25, 0.25, 0.25, 0.25],
 });
 
-var scenario_payoffs = {
-    'restaurant': { // sample scenario
-        'A': {'A': 5, 'B': 3}, // the action that benefits A
-        'B': {'A': 3, 'B': 5} // the action that benefits B
-    }
-}
+// base actor
+var base_actor = function (scenario, closeness_A, closeness_R) {
+  return Infer({ method: "enumerate" }, function () {
+    var action_risk = uniformDraw([1, 2, 3]); // prior on actions
+    var U_comfort_A = comfort(scenario, closeness_A, action_risk);
+    var U_comfort_R = comfort(scenario, closeness_R, action_risk);
+    factor(params.beta * (U_comfort_A + params.comfort_discount * U_comfort_R));
+    return { action_risk: action_risk };
+  });
+};
 
-// exp 1 stuff
-var observer = function(payoffs, action_sequence) {
-    return Infer({method: 'enumerate'}, function () {
+// base receiver sees an action and infers closeness
+var base_receiver = function (scenario, closeness_R, beliefs, action_risk) {
+  return Infer({ method: "enumerate" }, function () {
+    var closeness_A = sample(beliefs);
+    observe(base_actor(scenario, closeness_A, closeness_R), {
+      action_risk: action_risk,
+    });
+    return { closeness_A: closeness_A };
+  });
+};
 
-      var first_weight = sample(Beta_disc({a: 1, b: 1}))
-      var weights = {
-        'w_A': first_weight,
-        'w_B': 1 - first_weight
-      }
+var comm_actor = function (scenario, closeness_A, beliefs) {
+  return Infer({ method: "enumerate" }, function () {
+    var closeness_R = sample(beliefs);
+    var action_risk = uniformDraw([1, 2, 3]); // prior on actions
+    var U_comfort_A = comfort(scenario, closeness_A, action_risk);
+    var U_comfort_R = comfort(scenario, closeness_R, action_risk);
+    factor(
+      params.beta *
+        (U_comfort_A +
+          params.comfort_discount * U_comfort_R +
+          0.1 * base_receiver(scenario, closeness_R, beliefs, action_risk).score({
+            closeness_A: closeness_A,
+          }))
+    );
+    return { action_risk: action_risk };
+  });
+};
 
-        var U_A = function(action) {
-            var R_A = payoffs[action]['A']
-            var R_B = payoffs[action]['B']
-            return R_A + weights['w_B'] * R_B
-        }
+// based on all the actions so far, update beliefs about closeness
 
-        var U_B = function(action) {
-            var R_A = payoffs[action]['A']
-            var R_B = payoffs[action]['B']
-            return R_B + weights['w_A'] * R_A
-        }
+var update_posterior = function (scenario, closeness_R, beliefs, actionsSoFar) {
+  return Infer({ method: "enumerate" }, function () {
+    var closeness_A = sample(beliefs);
+    // console.log(closeness_A);
 
-        var asymmetry = Math.abs((weights['w_A'] - weights['w_B']))
+    mapData({ data: actionsSoFar }, function (action) {
+    //   observe(base_actor(scenario, closeness_A, closeness_R), {
+    //     action_risk: action,
+    //   });
 
-        var obsFn = function(datum){
-            factor(params.alpha * U_A(datum))
-            factor(params.alpha * U_B(datum))
-        }
+      observe(comm_actor(scenario, closeness_A, closeness_prior), {
+        action_risk: action,
+      });
+    });
 
-        mapData({data: action_sequence}, obsFn)
+    return { closeness_A: closeness_A };
+  });
+};
 
-        return {
-          'w_A': weights['w_A'],
-          'w_B': weights['w_B'],
-          'asymmetry': asymmetry
-        }
-    })
-}
+var conditions = _.flattenDeep(
+  map(function (closeness_alice) {
+    return map(function (closeness_bob) {
+      return {
+        closeness_alice: closeness_alice,
+        closeness_bob: closeness_bob,
+      };
+    }, params.closenesses);
+  }, params.closenesses)
+);
 
-// exp 2 stuff
+var run = function (scenario, condition, dataSoFar) {
+  var alice_priors = closeness_prior;
+  var bob_priors = closeness_prior;
 
-var actor = function(payoffs, weights) {
-    return Infer({method: 'enumerate'}, function () {
-        var action = flip(0.5) ? 'A' : 'B' // only two possible actions here: the action that benefits A, and the one that benefits B
-        var R_A = payoffs[action]['A']
-        var R_B = payoffs[action]['B']
-        var U_A = (1 - weights['w_B']) * R_A + weights['w_B'] * R_B
-        var U_B = (1 - weights['w_A']) * R_B + weights['w_A'] * R_A
-        factor(params.alpha * U_A)
-        factor(params.alpha * U_B)
-        return action
-    })
-}
+  var alice_posterior = marginalize(
+    update_posterior(
+      scenario,
+      condition.closeness_alice,
+      alice_priors,
+      dataSoFar.bob_actions
+    ),
+    "closeness_A"
+  );
+  var alice_action = sample(
+    comm_actor(scenario, condition.closeness_alice, alice_posterior)
+  );
 
-var update_posterior = function(payoffs, first_action, asymmetry) {
-    return Infer({method: 'enumerate'}, function() {
-      var first_weight = asymmetry == false ? 0.5 : sample(Beta_disc({a: 1, b: 1}))
-      var weights = {
-        'w_A': first_weight,
-        'w_B': 1 - first_weight
-      }
+  var bob_posterior = marginalize(
+    update_posterior(
+      scenario,
+      condition.closeness_bob,
+      bob_priors,
+      dataSoFar.alice_actions.concat(alice_action.action_risk)
+    ),
+    "closeness_A"
+  );
+  var bob_action = sample(
+    comm_actor(scenario, condition.closeness_bob, bob_posterior)
+  );
 
-      var U_A = function(action) {
-            var R_A = payoffs[action]['A']
-            var R_B = payoffs[action]['B']
-            return R_A + weights['w_B'] * R_B
-        }
+  var newDataSoFar = {
+    alice_actions: dataSoFar.alice_actions.concat(alice_action.action_risk),
+    bob_actions: dataSoFar.bob_actions.concat(bob_action.action_risk),
+    alice_beliefs: dataSoFar.alice_beliefs.concat(alice_posterior.score(condition.closeness_bob)),
+    bob_beliefs: dataSoFar.bob_beliefs.concat(bob_posterior.score(condition.closeness_alice))
+  };
 
-     var U_B = function(action) {
-            var R_A = payoffs[action]['A']
-            var R_B = payoffs[action]['B']
-            return R_B + weights['w_A'] * R_A
-        }
-
-      factor(params.alpha * U_A(first_action))
-      factor(params.alpha * U_B(first_action))
-
-    return weights
-    })
-
+  if (dataSoFar.alice_actions.length < params.n_rounds) {
+    return run(scenario, condition, newDataSoFar);
+  } else {
+    return {
+      data: newDataSoFar,
+      condition: condition,
+      scenario: scenario
+    }; // this is run_output
   }
+};
 
-var next_action = function(payoffs, first_action, asymmetry) {
-  return Infer({method: 'enumerate'}, function() {
-      var weights = sample(update_posterior(payoffs, first_action, asymmetry))
-      var next_action = sample(actor(payoffs, weights))
+var f = csv.open("output_commweight1.csv");
+csv.writeLine(
+  "beta,comfort_discount,participant_num,closeness_alice,closeness_bob,round,alice_action,bob_action,alice_beliefs,bob_beliefs",
+  f
+);
 
-      return next_action
-  })
+var writeData = function (participant_num, condition, run_output) {
+  mapN(function (i) {
+    // console.log(run_output.alice_actions)
+    // console.log(run_output)
+    csv.writeLine(
+      [params.beta,
+        params.comfort_discount,
+        participant_num,
+        condition.closeness_alice,
+        condition.closeness_bob,
+        i,
+        run_output.data.alice_actions[i],
+        run_output.data.bob_actions[i],
+        Math.exp(run_output.data.alice_beliefs[i]),
+        Math.exp(run_output.data.bob_beliefs[i])
+      ].join(","),
+      f
+    );
+  }, params.n_rounds);
+};
+
+var simulate = function (participant_num, condition) {
+//   console.log(condition)
+  var run_output = run("mac", condition, {
+    alice_actions: [],
+    bob_actions: [],
+    alice_beliefs: [],
+    bob_beliefs: []
+  });
+//   console.log(run_output)
+  writeData(participant_num, condition, run_output);
+};
+
+var simulateAll = function (participants) {
+    mapN(function (participant_num) {
+        console.log("participant " + participant_num)
+        map(function (condition) {
+            simulate(participant_num, condition);
+        }, conditions);
+    }, participants);
 }
 
-// experiment 1 — from action sequence, infer weights and amount of asymmetry
+simulateAll(params.participants)
 
-viz.marginals(observer(scenario_payoffs['restaurant'], ['A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A'])) // precedent
-viz.marginals(observer(scenario_payoffs['restaurant'], ['B', 'B', 'B', 'B', 'B', 'B', 'B', 'B', 'B', 'B', 'B', 'B', 'B','B'])) // precedent
-viz.marginals(observer(scenario_payoffs['restaurant'], ['A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B', 'A', 'B'])) // reciprocity
-
-// experiment 2 - from relationship symmetry, and one action, infer next action
-
-viz(next_action(scenario_payoffs['restaurant'], 'A', true))
-viz(next_action(scenario_payoffs['restaurant'], 'B', true))
-viz(next_action(scenario_payoffs['restaurant'], 'A', false))
-
+csv.close(f)
